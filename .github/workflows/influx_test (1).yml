@@ -1,0 +1,37 @@
+name: Influx Connection Test
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install influxdb3-python
+
+      - name: Run test
+        env:
+          INFLUX_URL:    ${{ secrets.INFLUX_URL }}
+          INFLUX_TOKEN:  ${{ secrets.INFLUX_TOKEN }}
+          INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
+          INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
+        run: |
+          python - << 'PY'
+          import os
+          from influxdb_client_3 import InfluxDBClient3
+          host=os.environ["INFLUX_URL"]
+          token=os.environ["INFLUX_TOKEN"]
+          org=os.environ["INFLUX_ORG"]
+          db=os.environ["INFLUX_BUCKET"]
+          print("Host:", host)
+          print("Org:", org)
+          print("Database:", db)
+          client = InfluxDBClient3(host=host, token=token, org=org, database=db)
+          print(list(client.query("SELECT 1")))
+          PY

@@ -1,0 +1,116 @@
+
+name: Predict behavior from Drive CSV and save back
+
+on:
+  
+  workflow_dispatch:
+    inputs:
+      drive_folder_id:
+        description: "Google Drive folder ID"
+        required: true
+        default: "1W-kmA5mwlnrheTKiAjVWh9xAEczk9wDg"
+      csv_filename:
+        description: "Optional: CSV filename in the folder (leave empty to use most recently modified CSV)"
+        required: false
+        default: ""
+      model_path:
+        description: "Path to the Keras .h5 model in the repo"
+        required: true
+        default: "model/ram_blstm_model.h5"
+      class_labels:
+        description: "Comma-separated labels (index order)"
+        required: false
+        default: "grazing,ruminating,walking,other"
+  schedule:
+    - cron: "*/5 * * * *"   # runs every 5 minutes (UTC)
+
+
+# prevent overlapping runs if one takes >5 mins
+concurrency:
+  group: predict-${{ github.ref }}
+  cancel-in-progress: false
+
+  
+jobs:
+  run-prediction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "tensorflow-cpu>=2.13,<2.17" pandas numpy h5py joblib scikit-learn \
+            google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib tqdm
+
+      - name: Write & validate service account credentials
+        shell: bash
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+        run: |
+          if [ -z "${GOOGLE_SERVICE_ACCOUNT_JSON_B64}" ]; then
+            echo "Secret GOOGLE_SERVICE_ACCOUNT_JSON_B64 is missing"; exit 1
+          fi
+          echo "${GOOGLE_SERVICE_ACCOUNT_JSON_B64}" | base64 --decode > sa.json
+          python - << 'PY'
+          import json
+          json.load(open('sa.json'))
+          print('sa.json is valid JSON.')
+          PY
+
+
+
+      - name: Create preproc bundle if missing
+        run: |
+          python - <<'PY'
+          import joblib
+          from pathlib import Path
+          p = Path('model/preproc.joblib')
+          if p.exists():
+            print('preproc.joblib already exists')
+          else:
+            scaler = joblib.load('model/artifacts/scaler.joblib')
+            feature_cols = joblib.load('model/artifacts/feature_cols.joblib')
+            le_path = Path('model/artifacts/label_encoder.joblib')
+            le = joblib.load(le_path) if le_path.exists() else None
+            p.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump({'scaler': scaler, 'feature_cols': feature_cols, 'label_encoder': le}, p)
+            print(f'Created {p}')
+          PY
+
+
+
+
+
+
+
+
+
+
+      - name: Run prediction
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+          INPUT_DRIVE_FOLDER_ID: ${{ github.event.inputs.drive_folder_id }}
+          INPUT_CSV_FILENAME: ${{ github.event.inputs.csv_filename }}
+          INPUT_MODEL_PATH: ${{ github.event.inputs.model_path }}
+          INPUT_CLASS_LABELS: ${{ github.event.inputs.class_labels }}
+          # If preproc.joblib sits next to your .h5, you can omit this:
+          PREPROC_PATH: model/preproc.joblib
+          OUTPUT_MODE: update   # or "create" to write a new file in the Drive folder
+        run: python model/predict.py
+
+      - name: Upload predictions artifact
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictions
+          path: |
+            *_predicted.csv

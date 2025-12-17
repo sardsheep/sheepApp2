@@ -1,0 +1,68 @@
+name: Push labeled CSV from Drive to InfluxDB Cloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_filename:
+        description: "Exact CSV name (leave empty to pick the most recent)"
+        required: false
+        default: ""
+      name_contains:
+        description: "When csv_filename is empty, filter by substring (e.g., _predicted.csv)"
+        required: false
+        default: "_predicted.csv"
+      download_all:
+        description: "Ingest ALL matching files? (true/false) default: false"
+        required: false
+        default: "false"
+
+jobs:
+  drive_to_influx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade packaging
+
+          pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib \
+                      influxdb-client pandas pytz
+
+      - name: Write & validate service account credentials
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+        run: |
+          [ -n "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" ] || { echo "Missing secret GOOGLE_SERVICE_ACCOUNT_JSON_B64"; exit 1; }
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 --decode > sa.json
+          python -c "import json; json.load(open('sa.json')); print('sa.json OK')"
+
+      - name: Download labeled CSV(s) from Google Drive
+        env:
+          #DRIVE_FOLDER_ID: ${{ github.event.inputs.drive_folder_id }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}   # ✅ use your secret here
+
+          CSV_FILENAME: ${{ github.event.inputs.csv_filename }}
+          NAME_CONTAINS: ${{ github.event.inputs.name_contains }}
+          DOWNLOAD_ALL: ${{ github.event.inputs.download_all }}
+        run: python scripts/download_from_drive.py
+
+      - name: Ingest downloaded CSV(s) into InfluxDB Cloud
+        env:
+          INFLUX_URL: ${{ secrets.INFLUX_URL }}
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}        # WRITE token
+          INFLUX_ORG: ${{ secrets.INFLUX_ORG }}
+          INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
+          MODEL_VERSION: drive-to-influx
+        run: |
+          test -s downloaded_list.txt || { echo "No files downloaded."; exit 1; }
+          xargs -a downloaded_list.txt python tools/ingest_influx.py

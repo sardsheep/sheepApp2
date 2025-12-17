@@ -1,0 +1,222 @@
+name: Predict behavior from Drive CSV and save back
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_folder_id:
+        description: "Google Drive folder ID"
+        required: true
+        default: "1W-kmA5mwlnrheTKiAjVWh9xAEczk9wDg"
+      csv_filename:
+        description: "Optional: CSV filename in the folder (leave empty to use most recently modified CSV)"
+        required: false
+        default: ""
+      model_path:
+        description: "Path to the Keras .h5 model in the repo"
+        required: true
+        default: "sheepApp/model/ram_blstm_model.h5"
+      class_labels:
+        description: "Comma-separated labels (index order). If count mismatches model output, falls back to class_0.."
+        required: false
+        default: "grazing,ruminating,walking,other"
+
+jobs:
+  run-prediction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Pin if needed to match how your model was saved
+          pip install "tensorflow-cpu>=2.13,<2.17" pandas numpy h5py \
+            google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib tqdm
+
+      - name: Write service account credentials
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > sa.json
+
+      - name: Create predict script
+        run: |
+          cat > predict.py << 'PY'
+          import os, io, re
+          import numpy as np
+          import pandas as pd
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+          from tensorflow.keras.models import load_model
+
+          DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+          def drive_client(sa_path: str):
+            creds = service_account.Credentials.from_service_account_file(sa_path, scopes=DRIVE_SCOPES)
+            return build("drive", "v3", credentials=creds)
+
+          def find_csv_in_folder(service, folder_id: str, filename: str = ""):
+            if filename:
+              q = f"'{folder_id}' in parents and name = '{filename}' and mimeType = 'text/csv' and trashed = false"
+            else:
+              q = f"'{folder_id}' in parents and mimeType = 'text/csv' and trashed = false"
+            resp = service.files().list(q=q, orderBy="modifiedTime desc",
+                                        fields="files(id,name,modifiedTime,size,mimeType)").execute()
+            files = resp.get("files", [])
+            if not files:
+              raise FileNotFoundError("No matching CSV files found in the specified folder.")
+            return files[0]["id"], files[0]["name"]
+
+          def download_file(service, file_id: str, local_path: str):
+            request = service.files().get_media(fileId=file_id)
+            with io.FileIO(local_path, mode="wb") as fh:
+              downloader = MediaIoBaseDownload(fh, request)
+              done = False
+              while not done:
+                status, done = downloader.next_chunk()
+
+          def upload_file(service, folder_id: str, local_path: str, upload_name: str):
+            meta = {"name": upload_name, "parents": [folder_id]}
+            media = MediaIoBaseUpload(io.FileIO(local_path, "rb"), mimetype="text/csv", resumable=True)
+            return service.files().create(body=meta, media_body=media, fields="id,name,webViewLink").execute()
+
+          def detect_xyz_columns(columns):
+            """
+            Detect contiguous triplets x_i,y_i,z_i for i starting at 1.
+            Returns the number of steps T and lists of colnames for x,y,z.
+            """
+            # Fast check
+            if not any(re.fullmatch(r"[xyz]_\d+", c) for c in columns):
+              return 0, [], [], []
+            T = 0
+            xs, ys, zs = [], [], []
+            i = 1
+            while True:
+              x, y, z = f"x_{i}", f"y_{i}", f"z_{i}"
+              if x in columns and y in columns and z in columns:
+                xs.append(x); ys.append(y); zs.append(z)
+                T += 1
+                i += 1
+              else:
+                break
+            return T, xs, ys, zs
+
+          def build_input_tensor(df: pd.DataFrame):
+            """
+            If ram2.csv-like wide format is found (x_1..z_T), returns (X, "3d") with shape [N, T, 3].
+            Otherwise raises asking for explicit feature columns.
+            """
+            cols = list(df.columns)
+            T, xs, ys, zs = detect_xyz_columns(cols)
+            # Drop obvious non-feature columns if present
+            drop_maybe = [c for c in ["sheep number", "real Time"] if c in df.columns]
+            if drop_maybe:
+              df = df.drop(columns=drop_maybe)
+              cols = list(df.columns)
+              # Re-detect after drop
+              T, xs, ys, zs = detect_xyz_columns(cols)
+
+            if T >= 3:
+              # Ensure equal length lists
+              assert len(xs) == len(ys) == len(zs) == T
+              # Build [N, T, 3] in axis order x,y,z
+              Xx = df[xs].to_numpy(dtype=np.float32)
+              Xy = df[ys].to_numpy(dtype=np.float32)
+              Xz = df[zs].to_numpy(dtype=np.float32)
+              N = len(df)
+              X = np.stack(
+                [Xx.reshape(N, T), Xy.reshape(N, T), Xz.reshape(N, T)],
+                axis=2  # -> [N, T, 3]
+              )
+              return X, "3d", T
+            else:
+              raise ValueError(
+                "Could not auto-detect x_i,y_i,z_i columns. "
+                "Provide a list of feature columns and reshape logic if needed."
+              )
+
+          def main():
+            folder_id     = os.getenv("INPUT_DRIVE_FOLDER_ID")
+            csv_filename  = os.getenv("INPUT_CSV_FILENAME", "").strip()
+            model_path    = os.getenv("INPUT_MODEL_PATH")
+            class_labels  = [c.strip() for c in os.getenv("INPUT_CLASS_LABELS", "").split(",") if c.strip()]
+
+            service = drive_client("sa.json")
+            file_id, file_name = find_csv_in_folder(service, folder_id, csv_filename)
+            print(f"Using CSV: {file_name} (id={file_id})")
+
+            # Download CSV
+            in_csv = "input.csv"
+            download_file(service, file_id, in_csv)
+
+            # Load data
+            df = pd.read_csv(in_csv)
+            # Keep a copy to attach predictions later in the original column order
+            df_out = df.copy()
+
+            # Build input tensor from wide x_i,y_i,z_i format
+            X, xtype, T = build_input_tensor(df)
+            print(f"Detected wide xyz format with T={T}; input tensor shape: {X.shape}")
+
+            # Load model
+            print(f"Loading model from {model_path}")
+            model = load_model(model_path)
+
+            # Predict
+            raw_pred = model.predict(X, verbose=0)
+
+            # Determine classes
+            if raw_pred.ndim == 2 and raw_pred.shape[1] > 1:
+              n_classes = raw_pred.shape[1]
+              idx = np.argmax(raw_pred, axis=1)
+              # map labels
+              if class_labels and len(class_labels) == n_classes:
+                labels = [class_labels[int(i)] for i in idx]
+              else:
+                if class_labels and len(class_labels) != n_classes:
+                  print(f"Provided class_labels ({len(class_labels)}) do not match model outputs ({n_classes}); using class_0.. fallback.")
+                labels = [f"class_{int(i)}" for i in idx]
+            else:
+              # binary or scalar output
+              idx = (raw_pred.ravel() >= 0.5).astype(int)
+              if class_labels and len(class_labels) >= 2:
+                labels = [class_labels[int(i)] for i in idx]
+              else:
+                labels = [f"class_{int(i)}" for i in idx]
+
+            # Append predictions
+            df_out["predict"] = labels
+
+            # Save output
+            base, ext = os.path.splitext(file_name)
+            out_name = f"{base}_predicted.csv"
+            out_path = out_name
+            df_out.to_csv(out_path, index=False)
+            print(f"Saved predictions to {out_path}")
+
+            # Upload back to Drive
+            uploaded = upload_file(service, folder_id, out_path, out_name)
+            print(f"Uploaded: {uploaded.get('name')} (id={uploaded.get('id')})")
+            print(f"Web link: {uploaded.get('webViewLink')}")
+
+          if __name__ == "__main__":
+            main()
+          PY
+
+      - name: Run prediction
+        env:
+          INPUT_DRIVE_FOLDER_ID: ${{ github.event.inputs.drive_folder_id }}
+          INPUT_CSV_FILENAME: ${{ github.event.inputs.csv_filename }}
+          INPUT_MODEL_PATH: ${{ github.event.inputs.model_path }}
+          INPUT_CLASS_LABELS: ${{ github.event.inputs.class_labels }}
+        run: |
+          python predict.py

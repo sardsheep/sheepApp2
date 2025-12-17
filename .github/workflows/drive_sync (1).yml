@@ -1,0 +1,34 @@
+name: Google Drive CSV Sync (on new file)
+
+on:
+  repository_dispatch:
+    types: [ drive-csv-added ]   # we'll send this from Google Apps Script
+  workflow_dispatch:             # still let you run it manually
+
+jobs:
+  drive-sync:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.client_payload.file_id != '' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      - name: Run Drive flatten script
+        env:
+          # You already use this in your script — keep it as-is
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+        run: |
+          echo "Processing Drive file: ${{ github.event.client_payload.file_name }} (${{ github.event.client_payload.file_id }})"
+          python pipeline/drive_script.py --file-id "$FILE_ID"
+
+          
+  
