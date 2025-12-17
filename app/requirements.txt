@@ -1,0 +1,14 @@
+packaging>=24.1
+matplotlib
+streamlit
+influxdb-client
+influxdb3-python
+pandas
+pytz
+openai>=1.40
+google-api-python-client>=2.140.0
+google-auth>=2.34.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1
+google-api-core>=2.19.0
+httplib2>=0.22.0
